@@ -9,7 +9,9 @@ class Settings(BaseSettings):
     github_webhook_secret: str = "dev-secret-change-me"
     verify_github_signature: bool = True
 
-    kafka_bootstrap_servers: str = "localhost:9092"
+    # KAFKA_ENABLED=false skips producer init. KAFKA_BOOTSTRAP is the broker list (e.g. localhost:9092).
+    kafka_enabled: bool = True
+    kafka_bootstrap: str = "localhost:9092"
     kafka_topic_github: str = "github-events"
     kafka_topic_dlq: str = "github-events-dlq"
     kafka_group_id: str = "impact-worker"

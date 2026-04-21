@@ -81,7 +81,7 @@ async def _run_consumer() -> None:
 
     consumer = AIOKafkaConsumer(
         settings.kafka_topic_github,
-        bootstrap_servers=settings.kafka_bootstrap_servers,
+        bootstrap_servers=settings.kafka_bootstrap,
         group_id=settings.kafka_group_id,
         enable_auto_commit=False,
         value_deserializer=lambda b: json.loads(b.decode("utf-8")),
