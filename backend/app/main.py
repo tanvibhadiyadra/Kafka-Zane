@@ -43,6 +43,6 @@ async def health():
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    print("🔥 Received event!!")
+    print("🔥 Received event!")
     print(data)
     return {"status": "ok"}
