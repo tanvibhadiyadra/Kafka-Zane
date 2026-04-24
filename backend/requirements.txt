@@ -1,0 +1,31 @@
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+pydantic==2.11.7
+pydantic-settings==2.10.1
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+# asyncpg  – used by PostgresService (webhook / onboarding)
+asyncpg==0.30.0
+# SQLAlchemy + psycopg v3 – used by the Kafka worker (impact analysis)
+sqlalchemy==2.0.41
+psycopg[binary]==3.2.9
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+# redis[asyncio] provides both redis.asyncio (webhook) and redis.Redis (worker)
+redis==6.2.0
+
+# ── Kafka ─────────────────────────────────────────────────────────────────────
+# confluent-kafka (librdkafka) – used by both producer (webhook) and consumer (worker)
+confluent-kafka==2.10.0
+
+# ── GitHub API ────────────────────────────────────────────────────────────────
+# PyGithub – used by ImpactAnalysisService to fetch PR files and post comments
+PyGithub==2.6.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.1.0
+requests==2.32.4

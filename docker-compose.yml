@@ -1,0 +1,162 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  QueryGuard – Unified Event-Driven Stack
+#
+#  Services:
+#    postgres   – tenant / installation source of truth (profile: local-db)
+#    redis      – fast tenant-id cache + idempotency store
+#    zookeeper  – required by Kafka
+#    kafka      – event bus  (github-events topic + github-events-dlq DLQ)
+#    kafdrop    – Kafka UI (http://localhost:9000)
+#    webhook    – FastAPI service that receives GitHub webhooks (ngrok target)
+#    worker     – Kafka consumer that runs impact analysis
+#
+#  Quick start (external Neon DB):
+#    cp .env.example .env && fill in values
+#    docker compose up redis zookeeper kafka kafdrop webhook worker
+#
+#  Quick start (local Postgres):
+#    docker compose --profile local-db up
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: qg_postgres
+    restart: unless-stopped
+    profiles: ["local-db"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-qguser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qgpass}
+      POSTGRES_DB: ${POSTGRES_DB:-queryguard}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qguser} -d ${POSTGRES_DB:-queryguard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: qg_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: qg_zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: qg_kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_started
+    ports:
+      - "9092:9092"     # host machine access (scripts, Kafka UI)
+      - "29092:29092"   # inter-container access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners:
+      #   PLAINTEXT      → inter-container (kafka:29092)
+      #   PLAINTEXT_HOST → host machine   (localhost:9092)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_MS: 604800000   # 7 days
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: qg_kafdrop
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERCONNECT: kafka:29092
+      JVM_OPTS: "-Xms32M -Xmx128M"
+    ports:
+      - "9000:9000"
+
+  # ── Application Services ────────────────────────────────────────────────────
+
+  webhook:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.webhook
+    container_name: qg_webhook
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Override Kafka to use the internal container listener
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"   # ← ngrok forwards public HTTPS to this port
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: qg_worker
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_URL: redis://redis:6379/0
+    # Scale horizontally:  docker compose up --scale worker=3
+    deploy:
+      replicas: 1
+
+volumes:
+  postgres_data:
+  zookeeper_data:
+  kafka_data:
