@@ -57,7 +57,8 @@ class Settings(BaseSettings):
 
     # ── Redis ─────────────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
-    REDIS_TENANT_TTL_SECONDS: int = 3600
+    # Tenant cache TTL for inst:{installation_id}. Use 0 for no expiry (persistent keys).
+    REDIS_TENANT_TTL_SECONDS: int = 0
 
     # ── Kafka ─────────────────────────────────────────────────────────────────
     # Accept both the backend and queryguard env-var names

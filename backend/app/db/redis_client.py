@@ -4,7 +4,7 @@ app/db/redis_client.py – Redis Client (PHASE 5)
 Cache schema:
   Key:    inst:{installation_id}
   Value:  tenant_id (plain string)
-  TTL:    REDIS_TENANT_TTL_SECONDS (default 1 hour)
+  TTL:    REDIS_TENANT_TTL_SECONDS (default 1 hour; 0 = no expiry)
 
 Why Redis and not Postgres directly?
   • TenantResolver is called on EVERY Kafka message.
@@ -12,7 +12,7 @@ Why Redis and not Postgres directly?
   • At 10k messages/min: difference between 100s and 1s of DB load.
 
 Cache invalidation:
-  • TTL-based: entries expire automatically after 1 hour.
+  • TTL-based: entries expire after REDIS_TENANT_TTL_SECONDS (unless 0 = persistent).
   • For immediate invalidation, call invalidate_tenant_cache() explicitly.
 
 Changes from original async version:
@@ -136,14 +136,17 @@ async def set_cached_tenant_id(installation_id: str, tenant_id: str) -> None:
     """
     try:
         r = await get_redis()
-        await r.setex(
-            name=_cache_key(installation_id),
-            time=settings.REDIS_TENANT_TTL_SECONDS,
-            value=tenant_id,
-        )
+        key = _cache_key(installation_id)
+        ttl = settings.REDIS_TENANT_TTL_SECONDS
+        if ttl <= 0:
+            await r.set(key, tenant_id)
+        else:
+            await r.setex(name=key, time=ttl, value=tenant_id)
         logger.debug(
-            "Redis SET | installation_id=%s tenant_id=%s ttl=%ds",   # FIX 3
-            installation_id, tenant_id, settings.REDIS_TENANT_TTL_SECONDS,
+            "Redis SET | installation_id=%s tenant_id=%s ttl=%s",
+            installation_id,
+            tenant_id,
+            "persistent" if ttl <= 0 else f"{ttl}s",
         )
     except (aioredis.RedisError, ConnectionError) as exc:   # FIX 2
         logger.warning("Redis set failed – continuing without cache | err=%s", exc)
