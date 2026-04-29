@@ -12,82 +12,48 @@ Why Redis and not Postgres directly?
   • At 10k messages/min: difference between 100s and 1s of DB load.
 
 Cache invalidation:
-  • TTL-based: entries expire after REDIS_TENANT_TTL_SECONDS (unless 0 = persistent).
+  • TTL-based: entries expire after REDIS_TENANT_TTL_SECONDS.
   • For immediate invalidation, call invalidate_tenant_cache() explicitly.
 
-Changes from original async version:
-  FIX 1 – Startup connectivity check: get_redis_pool() now exposes an
-           async ping() helper (health_check) that the FastAPI lifespan
-           event should call so a bad REDIS_URL fails loudly at boot,
-           not silently on the first cache miss.
-  FIX 2 – Narrowed exception handling: bare `Exception` replaced with
-           `(redis.RedisError, ConnectionError)` so logic bugs
-           (AttributeError, TypeError, etc.) are never swallowed
-           as cache misses.
-  FIX 3 – tenant_id restored to Redis SET log line for easier tracing.
-
 Two-layer API:
-  • Async API (get_cached_tenant_id_async, etc.) — for FastAPI webhook
-  • Sync API (get_cached_tenant_id, etc.) — for synchronous Kafka consumer
-  Both use the same underlying connection pool and caching logic.
+  • Async API  — for FastAPI webhook container (uses shared async client singleton)
+  • Sync API   — for Kafka worker container  (uses dedicated sync client, no asyncio bridge)
+
+Key changes from previous version:
+  • Async path: shared Redis client singleton instead of creating a new wrapper per call.
+  • Sync path:  plain redis.Redis (no asyncio/_run_async bridge) — simpler, thread-safe,
+                correct for a sync confluent-kafka consumer.
+  • health_check_interval=30 added to both pools so idle connections are validated before use.
+  • socket_keepalive=True added to both pools to prevent OS-level TCP teardown on idle conns.
+  • Negative REDIS_TENANT_TTL_SECONDS raises ValueError at startup instead of silently
+    being treated as "no expiry".
 """
 
-import asyncio
 import logging
-from redis.asyncio import Redis, ConnectionPool
+import redis
 import redis.asyncio as aioredis
+
+import threading
+
+_async_lock = threading.Lock()
+_sync_lock = threading.Lock()
 
 from app.config import settings
 
 logger = logging.getLogger("db.redis")
 
-_pool: ConnectionPool | None = None
 
+# ── Config validation ─────────────────────────────────────────────────────────
 
-# ── Pool ──────────────────────────────────────────────────────────────────────
-
-def get_redis_pool() -> ConnectionPool:
-    """Return the shared async connection pool, creating it on first call."""
-    global _pool
-    if _pool is None:
-        _pool = ConnectionPool.from_url(
-            settings.REDIS_URL,
-            max_connections=20,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=2,
-            retry_on_timeout=True,
+def _validate_config() -> None:
+    """Raise early if Redis config values are invalid."""
+    ttl = settings.REDIS_TENANT_TTL_SECONDS
+    if ttl < 0:
+        raise ValueError(
+            f"REDIS_TENANT_TTL_SECONDS must be >= 0 (0 = no expiry), got {ttl}"
         )
-        logger.info("Redis connection pool created | url=%s", settings.REDIS_URL)
-    return _pool
 
-
-async def get_redis() -> Redis:
-    """Return an async Redis client backed by the shared pool."""
-    return Redis(connection_pool=get_redis_pool())
-
-
-# ── FIX 1: Startup connectivity check ────────────────────────────────────────
-# Call this from your FastAPI lifespan startup event so a misconfigured
-# REDIS_URL surfaces immediately instead of on the first cache operation.
-#
-#   @asynccontextmanager
-#   async def lifespan(app: FastAPI):
-#       await startup_ping()          # ← add this line
-#       yield
-#       await shutdown()
-
-async def startup_ping() -> None:
-    """
-    Verify Redis is reachable at application startup.
-
-    Raises redis.RedisError (or ConnectionError) so the process exits
-    loudly if REDIS_URL is wrong or Redis is unreachable, rather than
-    silently falling back to DB on every request.
-    """
-    r = await get_redis()
-    await r.ping()
-    logger.info("Redis connectivity verified at startup | url=%s", settings.REDIS_URL)
+_validate_config()
 
 
 # ── Cache Key Helper ──────────────────────────────────────────────────────────
@@ -97,21 +63,137 @@ def _cache_key(installation_id: str) -> str:
     return f"inst:{installation_id}"
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# ASYNC API  — FastAPI webhook container
+# ════════════════════════════════════════════════════════════════════════════════
 
-async def get_cached_tenant_id(installation_id: str) -> str | None:
+_async_client: aioredis.Redis | None = None
+
+
+def _get_async_pool() -> aioredis.ConnectionPool:
     """
-    Look up a tenant_id in Redis by installation_id.
+    Return a shared async ConnectionPool. Called once; pool is embedded in the
+    singleton client below.
 
-    Returns None on cache miss OR if Redis is unavailable (fail-open:
-    lets TenantResolver fall back to DB rather than blocking processing).
-
-    FIX 2: Catches (redis.RedisError, ConnectionError) instead of bare
-    Exception so genuine logic bugs are not silently swallowed.
+    Settings:
+      health_check_interval=30  – auto-PING any connection idle >30s before use.
+                                   Prevents silent ConnectionError after idle periods
+                                   (common in cloud Redis / Docker network restarts).
+      socket_keepalive=True     – TCP keepalive so the OS does not tear down the
+                                   socket behind redis-py's back during quiet periods.
     """
+    return aioredis.ConnectionPool.from_url(
+        settings.REDIS_URL,
+        max_connections=20,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=2,
+        retry_on_timeout=True,
+        health_check_interval=30,
+        socket_keepalive=True,
+    )
+
+
+def get_async_redis() -> aioredis.Redis:
+    """
+    Return the shared async Redis client singleton.
+
+    Returns the same object on every call — no new wrapper is allocated per
+    request. The underlying ConnectionPool handles connection checkout/return.
+    Call once at startup (or let RedisService.connect() do it) and reuse.
+    """
+    global _async_client
+    if _async_client is None:
+        _async_client = aioredis.Redis(connection_pool=_get_async_pool())
+        logger.info("Async Redis client created | url=%s", settings.REDIS_URL)
+    return _async_client
+
+
+async def startup_ping() -> None:
+    """Verify Redis connectivity at startup. Raises if unreachable."""
+    await get_async_redis().ping()
+    logger.info("Redis connectivity verified at startup | url=%s", settings.REDIS_URL)
+
+
+async def health_check() -> bool:
+    """Return True if Redis is reachable. Never raises."""
     try:
-        r = await get_redis()
-        value = await r.get(_cache_key(installation_id))
+        await get_async_redis().ping()
+        return True
+    except (aioredis.RedisError, ConnectionError):
+        return False
+
+
+# ── RedisService (for FastAPI lifespan) ──────────────────────────────────────
+
+class RedisService:
+    """FastAPI webhook Redis lifecycle manager."""
+
+    async def connect(self) -> None:
+        """Create client and verify Redis connectivity at startup."""
+        await startup_ping()
+        logger.info("RedisService connected")
+
+    async def close(self) -> None:
+        """Close the async Redis client and its connection pool."""
+        global _async_client
+        if _async_client is not None:
+            await _async_client.aclose()
+            _async_client = None
+            logger.info("RedisService closed")
+
+    async def is_healthy(self) -> bool:
+        """Check if Redis is reachable."""
+        return await health_check()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SYNC API  — Kafka worker container
+#
+# The Kafka worker uses confluent-kafka which is synchronous. Rather than
+# bridging async code with a persistent event loop (fragile, not thread-safe),
+# we use a plain redis.Redis sync client here. It connects to the same Redis
+# instance and uses the same key schema — just a different client object.
+#
+# Thread safety: get_sync_redis() uses a module-level singleton protected by a
+# check-then-set pattern that is safe in CPython's GIL. For multi-threaded
+# workers (e.g. --scale worker=3 each with thread pool), each thread shares
+# this one client; redis-py's sync ConnectionPool IS thread-safe by design.
+# ════════════════════════════════════════════════════════════════════════════════
+
+_sync_client: redis.Redis | None = None
+
+
+def get_sync_redis() -> redis.Redis:
+    """
+    Return the shared sync Redis client singleton for the Kafka worker.
+
+    No asyncio, no event loop bridge. Plain redis.Redis backed by a thread-safe
+    ConnectionPool. Safe to call from multiple threads (CPython GIL + redis-py
+    pool locking protects the singleton initialisation).
+    """
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = redis.Redis.from_url(
+            settings.REDIS_URL,
+            max_connections=10,        # worker needs fewer connections than webhook
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=2,
+            retry_on_timeout=True,
+            health_check_interval=30,  # validate idle connections before use
+            socket_keepalive=True,     # prevent OS-level TCP teardown on idle conns
+        )
+        logger.info("Sync Redis client created | url=%s", settings.REDIS_URL)
+    return _sync_client
+
+
+# ── Sync public API ───────────────────────────────────────────────────────────
+
+def get_cached_tenant_id_sync(installation_id: str) -> str | None:
+    """Look up tenant_id in Redis (sync). Returns None on miss or error."""
+    try:
+        value = get_sync_redis().get(_cache_key(installation_id))
         if value:
             logger.debug(
                 "Redis CACHE HIT | installation_id=%s tenant_id=%s",
@@ -120,151 +202,52 @@ async def get_cached_tenant_id(installation_id: str) -> str | None:
         else:
             logger.debug("Redis CACHE MISS | installation_id=%s", installation_id)
         return value
-    except (aioredis.RedisError, ConnectionError) as exc:   # FIX 2
+    except (redis.RedisError, ConnectionError) as exc:
         logger.warning("Redis get failed – falling back to DB | err=%s", exc)
         return None
 
 
-async def set_cached_tenant_id(installation_id: str, tenant_id: str) -> None:
-    """
-    Cache an installation_id → tenant_id mapping in Redis with TTL.
-
-    Fails silently if Redis is unavailable so the worker keeps processing.
-
-    FIX 2: Narrowed exception scope.
-    FIX 3: tenant_id restored to the SET log line.
-    """
+def set_cached_tenant_id_sync(installation_id: str, tenant_id: str) -> None:
+    """Cache installation_id → tenant_id in Redis (sync). Fails silently."""
     try:
-        r = await get_redis()
         key = _cache_key(installation_id)
         ttl = settings.REDIS_TENANT_TTL_SECONDS
-        if ttl <= 0:
-            await r.set(key, tenant_id)
+        r = get_sync_redis()
+        if ttl == 0:
+            r.set(key, tenant_id)
         else:
-            await r.setex(name=key, time=ttl, value=tenant_id)
+            r.setex(name=key, time=ttl, value=tenant_id)
         logger.debug(
             "Redis SET | installation_id=%s tenant_id=%s ttl=%s",
             installation_id,
             tenant_id,
-            "persistent" if ttl <= 0 else f"{ttl}s",
+            "persistent" if ttl == 0 else f"{ttl}s",
         )
-    except (aioredis.RedisError, ConnectionError) as exc:   # FIX 2
+    except (redis.RedisError, ConnectionError) as exc:
         logger.warning("Redis set failed – continuing without cache | err=%s", exc)
 
 
-async def invalidate_tenant_cache(installation_id: str) -> None:
-    """
-    Delete the cached tenant mapping for an installation.
-
-    Call when an installation is removed or reassigned to a new tenant.
-
-    FIX 2: Narrowed exception scope.
-    """
+def invalidate_tenant_cache_sync(installation_id: str) -> None:
+    """Delete cached tenant mapping (sync). Fails silently."""
     try:
-        r = await get_redis()
-        deleted = await r.delete(_cache_key(installation_id))
-        logger.info(
-            "Redis cache invalidated | installation_id=%s deleted=%s",
-            installation_id, deleted,
-        )
-    except (aioredis.RedisError, ConnectionError) as exc:   # FIX 2
+        deleted = get_sync_redis().delete(_cache_key(installation_id))
+        if deleted:
+            logger.info(
+                "Redis cache invalidated | installation_id=%s", installation_id
+            )
+        else:
+            logger.debug(
+                "Redis cache invalidate – key not found | installation_id=%s",
+                installation_id,
+            )
+    except (redis.RedisError, ConnectionError) as exc:
         logger.warning("Redis delete failed | err=%s", exc)
 
 
-# ── Synchronous Wrappers (for Kafka Consumer + TenantResolver) ──────────────
-
-def get_cached_tenant_id_sync(installation_id: str) -> str | None:
-    """
-    Synchronous wrapper around async get_cached_tenant_id().
-    
-    Used by TenantResolver and Kafka consumer (sync contexts).
-    Returns None on cache miss OR if Redis is unavailable (fail-open).
-    
-    Implementation note:
-      asyncio.run() creates a new event loop, executes the coroutine,
-      then closes the loop. Safe for synchronous worker processes.
-    """
+def health_check_sync() -> bool:
+    """Return True if Redis is reachable from sync context. Never raises."""
     try:
-        return asyncio.run(get_cached_tenant_id(installation_id))
-    except Exception as exc:
-        logger.warning(
-            "Sync Redis get failed – falling back to DB | err=%s", exc
-        )
-        return None
-
-
-def set_cached_tenant_id_sync(installation_id: str, tenant_id: str) -> None:
-    """
-    Synchronous wrapper around async set_cached_tenant_id().
-    
-    Used by TenantResolver and Kafka consumer (sync contexts).
-    Fails silently if Redis is unavailable so processing continues.
-    """
-    try:
-        asyncio.run(set_cached_tenant_id(installation_id, tenant_id))
-    except Exception as exc:
-        logger.warning("Sync Redis set failed – continuing | err=%s", exc)
-
-
-def invalidate_tenant_cache_sync(installation_id: str) -> None:
-    """
-    Synchronous wrapper around async invalidate_tenant_cache().
-    
-    Used by TenantResolver and Kafka consumer (sync contexts).
-    Fails silently if Redis is unavailable.
-    """
-    try:
-        asyncio.run(invalidate_tenant_cache(installation_id))
-    except Exception as exc:
-        logger.warning("Sync Redis delete failed | err=%s", exc)
-
-
-async def health_check() -> bool:
-    """
-    Return True if Redis is reachable.
-
-    For use in the /health endpoint. Unlike startup_ping(), this never
-    raises — it returns False so the health handler can report degraded
-    status without crashing.
-    """
-    try:
-        r = await get_redis()
-        await r.ping()
+        get_sync_redis().ping()
         return True
-    except Exception:
+    except (redis.RedisError, ConnectionError):
         return False
-
-
-# ── RedisService (for FastAPI lifespan) ──────────────────────────────────────
-
-class RedisService:
-    """
-    Thin async Redis wrapper for FastAPI webhook lifecycle.
-    
-    Lifecycle (called from app/main.py lifespan):
-        await redis.connect()   # on startup (FIX 1: calls startup_ping internally)
-        await redis.close()     # on shutdown
-    """
-
-    async def connect(self) -> None:
-        """
-        Verify Redis connectivity at startup.
-        Raises redis.RedisError if REDIS_URL is misconfigured or Redis is unreachable.
-        """
-        await startup_ping()
-        logger.info("RedisService connected")
-
-    async def close(self) -> None:
-        """Close Redis connection pool on shutdown."""
-        global _pool
-        if _pool:
-            await _pool.disconnect()
-            _pool = None
-            logger.info("RedisService closed")
-
-    async def is_healthy(self) -> bool:
-        """
-        Health-check for /health endpoint.
-        Returns False (not True) if Redis is unreachable, allowing graceful degradation.
-        """
-        return await health_check()

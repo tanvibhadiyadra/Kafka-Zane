@@ -27,7 +27,6 @@ from confluent_kafka import Consumer, KafkaError
 
 from app.config import settings
 from app.db.postgres import get_db_session
-from app.db.redis_client import get_cached_tenant_id, set_cached_tenant_id
 from app.kafka.producer import publish_to_dlq
 from app.services.tenant_resolver import TenantResolver, TenantResolutionError
 from app.services.impact_analysis import ImpactAnalysisService
