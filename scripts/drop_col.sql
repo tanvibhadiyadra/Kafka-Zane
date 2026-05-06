@@ -1,0 +1,1 @@
+DROP COlUMN name From TABLE P_DATA;
